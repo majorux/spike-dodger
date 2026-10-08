@@ -1,0 +1,1113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Spike Dodger</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #07030d;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-family: "Trebuchet MS", "Segoe UI", system-ui, sans-serif;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  #game {
+    display: block;
+    box-shadow: 0 0 70px rgba(120, 40, 180, 0.45);
+    border-radius: 8px;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+/* ==========================================================================
+   SPIKE DODGER
+   Flappy-bird controls, but there are no pipes and no gaps: spiked triangles
+   fly in from the right and you weave around them.
+
+   Timing model
+   ------------
+   Everything runs off requestAnimationFrame with a delta time measured in
+   seconds ("dt"). CONFIG values that are written as "per frame" are authored
+   at 60 fps, so they are applied through a delta-frame factor df = dt * 60.
+   Values written as "per second" (spike speed, spawn timers) use dt directly.
+   Result: identical game speed on 60 Hz, 120 Hz, 144 Hz and laggy monitors.
+   ========================================================================== */
+
+
+/* ==========================================================================
+   1. CONFIG  - every tunable number lives here
+   ========================================================================== */
+const CONFIG = {
+
+  /* ---- Canvas ---- */
+  W: 1152,                      // logical width, landscape
+  H: 648,                       // logical height
+
+  /* ---- Layout ---- */
+  birdXRatio: 0.20,             // bird's fixed x = W * this (never moves horizontally)
+  groundHeight: 64,             // rocky strip height at the bottom
+
+  /* ---- Bird ---- */
+  birdRadius: 21,               // drawn body radius
+  hitboxScale: 0.80,            // hitbox radius = birdRadius * 0.80  (20% smaller)
+  startYRatio: 0.42,            // spawn height, fraction of the playfield
+  gravity: 0.45,                // px per frame^2   @60fps
+  flapVelocity: -7.0,           // px per frame     @60fps  (set directly on flap)
+  maxFallSpeed: 14,             // px per frame     @60fps  terminal velocity
+  wingSpeed: 15.0,              // wing animation speed (rad/s)
+  tiltStrength: 0.055,          // how much the bird tilts with its vertical speed
+  maxTilt: 0.55,                // radians
+
+  /* ---- Spikes ---- */
+  spikeWidth: 46,               // horizontal length of the triangle (base -> tip)
+  spikeHeightMin: 70,           // px
+  spikeHeightMax: 165,          // px
+  spikeHitboxScale: 0.85,       // collision triangle is shrunk slightly (forgiving)
+  speedStart: 250,              // px / second
+  speedGain: 6.5,               // px / second added per second survived
+  speedMax: 620,                // px / second cap
+  speedVariance: 0.05,          // +-5% speed per individual spike
+  spawnMargin: 60,              // how far off-screen right spikes are created
+  waveStagger: 72,              // x spacing between spikes inside a single wave
+  telegraphTime: 0.6,           // seconds the blinking "!" warns you before a spawn
+  blinkRate: 15,                // "!" blink speed
+  freeBandRatio: 0.50,          // fraction of the playfield left clear = the safe path
+  chaseChance: 0.40,            // 40% of waves aim at the bird's current height
+  edgeMargin: 14,               // keep spikes away from the ceiling and the ground
+  laneSwitchSeconds: 0.72,      // time the bird needs to cross from lane to lane
+  reactionSeconds: 0.16,        // human reaction cushion on top of that
+
+  /* ---- Wave pacing ---- */
+  intervalMinStart: 0.80,       // s, fastest gap at t = 0
+  intervalMaxStart: 1.50,       // s, slowest gap at t = 0
+  intervalShrink: 0.020,        // s removed from the low bound per second survived
+  intervalShrinkMax: 1.45,      // how much faster the high bound shrinks
+  intervalFloor: 0.50,          // s, hard fastest pace
+  easyTime: 5.0,                // the first N seconds are gentler
+  easyIntervalMult: 1.90,       // ...spikes arrive this much less often
+  easyWaveCount: 1,             // ...and always a single spike
+  waveRampTime: 50,             // seconds over which waves grow to 3 spikes
+
+  /* ---- Background ---- */
+  starCount: 90,
+  starZone: 0.62,               // stars only occupy the top fraction of the sky
+  mountains: [
+    // far layer: lightest and tallest, slowest parallax
+    { color: "#3a1a66", rim: "rgba(150, 100, 220, 0.35)", speed: 6,  spacing: 205, segments: 11, heightMin: 150, heightMax: 268 },
+    // mid layer
+    { color: "#281046", rim: "rgba(120, 80, 190, 0.22)",  speed: 15, spacing: 170, segments: 12, heightMin: 110, heightMax: 208 },
+    // near layer: darkest
+    { color: "#150724", rim: "rgba(100, 70, 160, 0.14)",  speed: 29, spacing: 132, segments: 13, heightMin: 62,  heightMax: 140 }
+  ],
+  groundSpeed: 120,             // px / second the rocky strip scrolls left
+  groundSpacing: 92,
+  groundSegments: 16,
+  groundRockCount: 54,          // loose boulders scattered through the strip
+  groundColors: ["#3f1d6a", "#2a1147", "#1b0c31", "#4a2480"],
+
+  /* ---- Misc ---- */
+  deathLock: 0.20,              // s of input lock after dying (anti double-tap)
+  shakeTime: 0.35,              // s of screen shake on death
+  shakeAmp: 14,                 // px
+  bestSaveInterval: 0.5         // s between storage writes while a record is running
+};
+
+/* ==========================================================================
+   2. Small utilities
+   ========================================================================== */
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+const rand = (lo, hi) => lo + Math.random() * (hi - lo);
+const lerp = (a, b, t) => a + (b - a) * t;
+
+// distance from point p to segment a-b
+function distToSeg(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const len2 = dx * dx + dy * dy;
+  let t = len2 === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = clamp(t, 0, 1);
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+// half-plane sign test used for point-in-triangle
+function sign(px, py, ax, ay, bx, by) {
+  return (px - bx) * (ay - by) - (ax - bx) * (py - by);
+}
+
+function pointInTri(px, py, ax, ay, bx, by, cx, cy) {
+  const d1 = sign(px, py, ax, ay, bx, by);
+  const d2 = sign(px, py, bx, by, cx, cy);
+  const d3 = sign(px, py, cx, cy, ax, ay);
+  const hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
+  const hasPos = d1 > 0 || d2 > 0 || d3 > 0;
+  return !(hasNeg && hasPos);
+}
+
+// circle vs triangle collision
+function circleTri(cx, cy, r, a, b, c) {
+  if (pointInTri(cx, cy, a.x, a.y, b.x, b.y, c.x, c.y)) return true;
+  if (distToSeg(cx, cy, a.x, a.y, b.x, b.y) <= r) return true;
+  if (distToSeg(cx, cy, b.x, b.y, c.x, c.y) <= r) return true;
+  if (distToSeg(cx, cy, c.x, c.y, a.x, a.y) <= r) return true;
+  return false;
+}
+
+
+/* ==========================================================================
+   3. Canvas + scaling (fits the window, keeps the aspect ratio, crisp HiDPI)
+   ========================================================================== */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  canvas.width = Math.round(CONFIG.W * dpr);
+  canvas.height = Math.round(CONFIG.H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+
+  const scale = Math.min(window.innerWidth / CONFIG.W, window.innerHeight / CONFIG.H);
+  canvas.style.width = Math.floor(CONFIG.W * scale) + "px";
+  canvas.style.height = Math.floor(CONFIG.H * scale) + "px";
+}
+
+// geometry derived from CONFIG, computed once
+const GROUND_Y = CONFIG.H - CONFIG.groundHeight;   // horizon + floor death line
+const BIRD_X = CONFIG.W * CONFIG.birdXRatio;       // the bird's one and only x
+const HITBOX_R = CONFIG.birdRadius * CONFIG.hitboxScale;
+
+/* ==========================================================================
+   4. BACKGROUND  - stars, 3 parallax mountain layers, rocky ground
+   ========================================================================== */
+const stars = [];
+const layers = [];      // mountain layers
+let ground = null;      // rocky strip
+
+function initStars() {
+  stars.length = 0;
+  for (let i = 0; i < CONFIG.starCount; i++) {
+    stars.push({
+      x: Math.random() * CONFIG.W,
+      y: Math.random() * GROUND_Y * CONFIG.starZone,
+      r: 0.6 + Math.random() * 1.5,
+      phase: Math.random() * Math.PI * 2,
+      twinkle: 0.7 + Math.random() * 2.1
+    });
+  }
+}
+
+// A layer is a jagged ridge stored as points over one repeating "period".
+// The wrap (last point -> period, using the first y) makes it tile seamlessly.
+function makeRidge(cfg, segments, spacing, heightMin, heightMax) {
+  const xs = [], ys = [];
+  let x = 0;
+  for (let i = 0; i < segments; i++) {
+    xs.push(x);
+    const isPeak = i % 2 === 0;
+    const h = isPeak
+      ? lerp(heightMax * 0.76, heightMax, Math.random())
+      : lerp(heightMin, heightMin * 1.45, Math.random());
+    ys.push(GROUND_Y - h);
+    x += spacing * (0.6 + Math.random() * 0.8);
+  }
+  return { xs, ys, period: x, scroll: 0, cfg };
+}
+
+function initBackground() {
+  initStars();
+  layers.length = 0;
+  for (const cfg of CONFIG.mountains) {
+    layers.push(makeRidge(cfg, cfg.segments, cfg.spacing, cfg.heightMin, cfg.heightMax));
+  }
+  // rocky ground ridge: y offsets wobble around the horizon
+  const rxs = [], rys = [];
+  let x = 0;
+  for (let i = 0; i < CONFIG.groundSegments; i++) {
+    rxs.push(x);
+    rys.push(rand(-14, 6));
+    x += CONFIG.groundSpacing * (0.6 + Math.random() * 0.9);
+  }
+
+  // loose boulders tiling over the same period as the ridge
+  const rocks = [];
+  for (let i = 0; i < CONFIG.groundRockCount; i++) {
+    const r = rand(3, 12);
+    rocks.push({
+      x: Math.random() * x,
+      y: rand(r + 7, CONFIG.groundHeight - 6),
+      rx: r,
+      ry: r * rand(0.55, 0.9),
+      rot: rand(-Math.PI, Math.PI),
+      color: CONFIG.groundColors[(Math.random() * CONFIG.groundColors.length) | 0]
+    });
+  }
+
+  ground = { xs: rxs, ys: rys, period: x, scroll: 0, rocks: rocks };
+}
+
+function updateBackground(dt) {
+  for (const L of layers) L.scroll = (L.scroll + L.cfg.speed * dt) % L.period;
+  ground.scroll = (ground.scroll + CONFIG.groundSpeed * dt) % ground.period;
+}
+
+function drawSky() {
+  // vertical gradient: deep indigo -> dark magenta at the horizon
+  const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+  g.addColorStop(0.00, "#1a0b2e");
+  g.addColorStop(0.55, "#2c1049");
+  g.addColorStop(1.00, "#4a1d6e");
+  ctx.fillStyle = g;
+  ctx.fillRect(-30, -30, CONFIG.W + 60, GROUND_Y + 60);
+
+  // warm glow hugging the horizon
+  const glow = ctx.createLinearGradient(0, GROUND_Y - 200, 0, GROUND_Y);
+  glow.addColorStop(0, "rgba(120, 47, 160, 0)");
+  glow.addColorStop(1, "rgba(176, 80, 205, 0.34)");
+  ctx.fillStyle = glow;
+  ctx.fillRect(-30, GROUND_Y - 200, CONFIG.W + 60, 230);
+}
+
+function drawStars(t) {
+  ctx.fillStyle = "#ecdfff";
+  for (const s of stars) {
+    ctx.globalAlpha = 0.30 + 0.70 * (0.5 + 0.5 * Math.sin(t * s.twinkle + s.phase));
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawMountains() {
+  const base = GROUND_Y + 6;
+  for (const L of layers) {
+    for (let k = 0; k < 2; k++) {
+      const off = k * L.period - L.scroll;
+      if (off > CONFIG.W) break;
+      if (off + L.period < -40) continue;
+
+      ctx.beginPath();
+      ctx.moveTo(off + L.xs[0], L.ys[0]);
+      for (let i = 1; i < L.xs.length; i++) ctx.lineTo(off + L.xs[i], L.ys[i]);
+      ctx.lineTo(off + L.period, L.ys[0]);      // seamless wrap
+      ctx.lineTo(off + L.period, base);
+      ctx.lineTo(off + L.xs[0], base);
+      ctx.closePath();
+      ctx.fillStyle = L.cfg.color;
+      ctx.fill();
+
+      // faint ridgeline highlight for depth
+      ctx.beginPath();
+      ctx.moveTo(off + L.xs[0], L.ys[0]);
+      for (let i = 1; i < L.xs.length; i++) ctx.lineTo(off + L.xs[i], L.ys[i]);
+      ctx.lineTo(off + L.period, L.ys[0]);
+      ctx.strokeStyle = L.cfg.rim;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+  }
+}
+
+function drawGround() {
+  // solid band
+  const g = ctx.createLinearGradient(0, GROUND_Y, 0, CONFIG.H);
+  g.addColorStop(0, "#2b1149");
+  g.addColorStop(0.30, "#1a0a2b");
+  g.addColorStop(1, "#0a0411");
+  ctx.fillStyle = g;
+  ctx.fillRect(-30, GROUND_Y, CONFIG.W + 60, CONFIG.groundHeight + 30);
+
+  // jagged rocky silhouette sitting on the horizon
+  for (let k = 0; k < 2; k++) {
+    const off = k * ground.period - ground.scroll;
+    if (off > CONFIG.W) break;
+    if (off + ground.period < -40) continue;
+
+    ctx.beginPath();
+    ctx.moveTo(off + ground.xs[0], GROUND_Y + ground.ys[0]);
+    for (let i = 1; i < ground.xs.length; i++) ctx.lineTo(off + ground.xs[i], GROUND_Y + ground.ys[i]);
+    ctx.lineTo(off + ground.period, GROUND_Y + ground.ys[0]);
+    ctx.lineTo(off + ground.period, CONFIG.H + 30);
+    ctx.lineTo(off + ground.xs[0], CONFIG.H + 30);
+    ctx.closePath();
+    ctx.fillStyle = "#3b1a63";
+    ctx.fill();
+
+    // loose boulders scattered across the strip
+    for (const rock of ground.rocks) {
+      const rx = off + rock.x;
+      if (rx < -30 || rx > CONFIG.W + 30) continue;
+      ctx.save();
+      ctx.translate(rx, GROUND_Y + rock.y);
+      ctx.rotate(rock.rot);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, rock.rx, rock.ry, 0, 0, Math.PI * 2);
+      ctx.fillStyle = rock.color;
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // lit rim along the top of the rocks
+    ctx.beginPath();
+    ctx.moveTo(off + ground.xs[0], GROUND_Y + ground.ys[0]);
+    for (let i = 1; i < ground.xs.length; i++) ctx.lineTo(off + ground.xs[i], GROUND_Y + ground.ys[i]);
+    ctx.lineTo(off + ground.period, GROUND_Y + ground.ys[0]);
+    ctx.strokeStyle = "rgba(150, 95, 215, 0.55)";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+}
+
+/* ==========================================================================
+   5. BIRD  - fixed x, vertical motion only, drawn from primitives
+   ========================================================================== */
+const bird = {
+  x: BIRD_X,
+  y: GROUND_Y * CONFIG.startYRatio,
+  vy: 0,          // px per frame (60fps units)
+  wingT: 0        // wing animation clock, jumps to -PI/2 on every flap
+};
+
+function resetBird() {
+  bird.x = BIRD_X;
+  bird.y = GROUND_Y * CONFIG.startYRatio;
+  bird.vy = 0;
+  bird.wingT = 0;
+}
+
+function flap() {
+  bird.vy = CONFIG.flapVelocity;      // set, not added
+  bird.wingT = -Math.PI / 2;          // snap the wing up, it sweeps down after
+}
+
+// df = delta frames at 60fps, so the tuning values behave frame-rate independently.
+// The trapezoidal step (average of old and new velocity) makes the trajectory
+// identical on any monitor instead of drifting with the Euler error.
+function updateBird(dt, df, floor) {
+  const v0 = bird.vy;
+  let v1 = v0 + CONFIG.gravity * df;
+  if (v1 > CONFIG.maxFallSpeed) v1 = CONFIG.maxFallSpeed;
+  bird.vy = v1;
+  bird.y += (v0 + v1) * 0.5 * df;
+  bird.wingT += dt * CONFIG.wingSpeed;
+
+  if (floor) {
+    // let the bird settle on the rocks instead of sinking through them
+    const rest = GROUND_Y - HITBOX_R;
+    if (bird.y > rest) { bird.y = rest; bird.vy = 0; }
+  }
+}
+
+function drawBird() {
+  const r = CONFIG.birdRadius;
+  const tilt = clamp(bird.vy * CONFIG.tiltStrength, -CONFIG.maxTilt, CONFIG.maxTilt);
+  const wing = Math.sin(bird.wingT);
+
+  ctx.save();
+  ctx.translate(bird.x, bird.y);
+  ctx.rotate(tilt);
+
+  // --- wing (behind the body) ---
+  ctx.save();
+  ctx.translate(-r * 0.20, r * 0.10);
+  ctx.rotate(wing * 0.85);
+  const wg = ctx.createLinearGradient(0, -r * 0.5, 0, r * 0.5);
+  wg.addColorStop(0, "#5ee06a");
+  wg.addColorStop(1, "#248a33");
+  ctx.beginPath();
+  ctx.ellipse(-r * 0.42, 0, r * 0.68, r * 0.36, -0.22, 0, Math.PI * 2);
+  ctx.fillStyle = wg;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#1a6327";
+  ctx.stroke();
+  ctx.restore();
+
+  // --- body ---
+  const bg = ctx.createRadialGradient(-r * 0.32, -r * 0.36, r * 0.12, 0, 0, r * 1.28);
+  bg.addColorStop(0.00, "#c6f77a");
+  bg.addColorStop(0.45, "#54d05a");
+  bg.addColorStop(1.00, "#2a8a3a");
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.fillStyle = bg;
+  ctx.fill();
+  ctx.lineWidth = 2.5;
+  ctx.strokeStyle = "#1c6b2c";
+  ctx.stroke();
+
+  // --- beak ---
+  ctx.beginPath();
+  ctx.moveTo(r * 0.70, -r * 0.22);
+  ctx.lineTo(r * 1.58, r * 0.02);
+  ctx.lineTo(r * 0.70, r * 0.32);
+  ctx.closePath();
+  ctx.fillStyle = "#ff9f1c";
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "#c26800";
+  ctx.stroke();
+
+  // --- eye ---
+  ctx.beginPath();
+  ctx.arc(r * 0.36, -r * 0.36, r * 0.27, 0, Math.PI * 2);
+  ctx.fillStyle = "#ffffff";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(20, 60, 20, 0.5)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(r * 0.45, -r * 0.36, r * 0.135, 0, Math.PI * 2);
+  ctx.fillStyle = "#0d0d0d";
+  ctx.fill();
+
+  ctx.restore();
+}
+
+
+/* ==========================================================================
+   6. SPIKES  - triangles pointing left, spawned off-screen right
+   ========================================================================== */
+const spikes = [];
+
+// speed grows with survival time and then caps out
+function currentSpeed() {
+  return Math.min(CONFIG.speedStart + CONFIG.speedGain * state.elapsed, CONFIG.speedMax);
+}
+
+// the spike's collision triangle (optionally shrunk toward its centroid)
+function spikeTri(s, scale) {
+  const half = s.h / 2;
+  const cx = s.x - s.w / 3;   // centroid x
+  const cy = s.y;
+  const pts = [
+    { x: s.x, y: s.y - half },
+    { x: s.x - s.w, y: s.y },
+    { x: s.x, y: s.y + half }
+  ];
+  if (scale === 1) return pts;
+  return pts.map(p => ({ x: cx + (p.x - cx) * scale, y: cy + (p.y - cy) * scale }));
+}
+
+function updateSpikes(dt) {
+  const base = currentSpeed();
+  for (let i = spikes.length - 1; i >= 0; i--) {
+    const s = spikes[i];
+    s.x -= base * s.speedMul * dt;
+    if (s.x + 12 < -CONFIG.spikeWidth) spikes.splice(i, 1);   // fully off-screen left
+  }
+}
+
+function drawSpike(s) {
+  const half = s.h / 2;
+  const tipX = s.x - s.w;
+
+  // cheap outer glow (no canvas shadowBlur -> stays fast)
+  ctx.beginPath();
+  ctx.moveTo(s.x, s.y - half * 1.18);
+  ctx.lineTo(tipX + s.w * 0.10, s.y);
+  ctx.lineTo(s.x, s.y + half * 1.18);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(255, 85, 0, 0.17)";
+  ctx.fill();
+
+  // the spike itself
+  const g = ctx.createLinearGradient(tipX, 0, s.x, 0);
+  g.addColorStop(0.00, "#ffd166");
+  g.addColorStop(0.40, "#ff7b1a");
+  g.addColorStop(1.00, "#c1121f");
+  ctx.beginPath();
+  ctx.moveTo(s.x, s.y - half);
+  ctx.lineTo(tipX, s.y);
+  ctx.lineTo(s.x, s.y + half);
+  ctx.closePath();
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "#ffe0a3";
+  ctx.stroke();
+
+  // dark socket where it entered from the right
+  ctx.fillStyle = "#8d0801";
+  ctx.fillRect(s.x - 1, s.y - half, 9, s.h);
+}
+
+/* ==========================================================================
+   7. WAVES + TELEGRAPHS
+   ========================================================================== */
+const waves = {
+  timer: 1.4,            // seconds until the next spawn
+  pending: null,         // a planned wave waiting out its telegraph
+  lastFreePath: null     // "top" | "bottom" - never the same twice in a row
+};
+
+// Alternate which side of the screen stays open, so the player can never just
+// park the bird in one lane.
+function pickFreePath() {
+  let pf = Math.random() < 0.5 ? "bottom" : "top";
+  if (pf === waves.lastFreePath) pf = pf === "bottom" ? "top" : "bottom";
+  waves.lastFreePath = pf;
+  return pf;
+}
+
+// How many spikes share one wave: always 1 during the easy opening, ramping up
+// to a healthy mix of 2s and 3s later on.
+function waveSpikeCount() {
+  const t = state.elapsed;
+  if (t < CONFIG.easyTime) return CONFIG.easyWaveCount;
+  const p = clamp((t - CONFIG.easyTime) / CONFIG.waveRampTime, 0, 1);
+  const oneChance = 0.70 - 0.35 * p;
+  const twoChance = 0.25 + 0.15 * p;
+  const r = Math.random();
+  if (r < oneChance) return 1;
+  if (r < oneChance + twoChance) return 2;
+  return 3;
+}
+
+// Gap between waves: starts inside 0.8-1.5s and shrinks as you survive, but it is
+// never allowed below the physical floor that lets the bird cross from the lane
+// this wave occupies into the opposite lane the next wave will occupy.
+function nextInterval(spanPx) {
+  const t = state.elapsed;
+  const lo = Math.max(CONFIG.intervalFloor, CONFIG.intervalMinStart - CONFIG.intervalShrink * t);
+  const hi = Math.max(
+    lo + 0.10,
+    CONFIG.intervalMaxStart - CONFIG.intervalShrink * CONFIG.intervalShrinkMax * t
+  );
+  let iv = lo + Math.random() * (hi - lo);
+  if (t < CONFIG.easyTime) iv *= CONFIG.easyIntervalMult;   // gentle opening
+
+  // Fairness floor: between the tail of the wave we just spawned and the head of
+  // the next one, the bird must have time to fly to the other lane.
+  const speed = currentSpeed() * (1 + CONFIG.speedVariance);   // assume the quickest spike
+  const minIv = CONFIG.laneSwitchSeconds + CONFIG.reactionSeconds + spanPx / speed;
+  return Math.max(iv, minIv);
+}
+
+// Where a spike is allowed to sit. Spikes always stay on the far side of the
+// safe lane, so at least CONFIG.freeBandRatio of the height is always flyable.
+function pickSpikeY(freePath, h, targetY) {
+  const half = h / 2;
+  const m = CONFIG.edgeMargin;
+  let yMin, yMax;
+
+  if (freePath === "bottom") {
+    // bottom lane stays clear -> spikes squeeze into the upper band
+    yMin = m + half;
+    yMax = GROUND_Y * (1 - CONFIG.freeBandRatio) - half;
+  } else {
+    // top lane stays clear -> spikes hang low
+    yMin = GROUND_Y * CONFIG.freeBandRatio + half;
+    yMax = GROUND_Y - m - half;
+  }
+  if (yMax < yMin) { const mid = (yMin + yMax) / 2; yMin = mid; yMax = mid; }
+
+  if (targetY === null) return rand(yMin, yMax);
+  return clamp(targetY, yMin, yMax);   // 40% of waves reach for the bird
+}
+
+// Everything about a wave is decided up front, so the "!" markers can be drawn
+// at the exact heights the spikes will actually appear at.
+function planWave() {
+  const freePath = pickFreePath();
+  const count = waveSpikeCount();
+  const chaseIndex = Math.random() < CONFIG.chaseChance ? Math.floor(Math.random() * count) : -1;
+
+  const items = [];
+  let x = CONFIG.W + CONFIG.spawnMargin;
+  for (let i = 0; i < count; i++) {
+    const h = rand(CONFIG.spikeHeightMin, CONFIG.spikeHeightMax);
+    const y = pickSpikeY(freePath, h, i === chaseIndex ? bird.y : null);
+    items.push({
+      x: x,
+      y: y,
+      h: h,
+      speedMul: 1 + rand(-1, 1) * CONFIG.speedVariance
+    });
+    x += CONFIG.waveStagger * rand(0.75, 1.35);
+  }
+  return { items };
+}
+
+function updateWaveScheduler(dt) {
+  waves.timer -= dt;
+
+  // Telegraph window: the wave is already decided, we are just showing the warning.
+  if (!waves.pending && waves.timer <= CONFIG.telegraphTime) {
+    waves.pending = planWave();
+  }
+
+  // Telegraph expired -> release the spikes, then schedule the next wave using
+  // this wave's own x-span so the gap is always physically flyable.
+  if (waves.pending && waves.timer <= 0) {
+    const items = waves.pending.items;
+    let span = 0;
+    for (const it of items) {
+      spikes.push({ x: it.x, y: it.y, h: it.h, w: CONFIG.spikeWidth, speedMul: it.speedMul });
+      span = Math.max(span, it.x - items[0].x);
+    }
+    waves.pending = null;
+    waves.timer = nextInterval(span);
+  }
+}
+
+function resetWaves() {
+  waves.timer = 1.4;
+  waves.pending = null;
+  waves.lastFreePath = null;
+  spikes.length = 0;
+}
+
+// Blinking "!" badges pinned to the right edge, 0.6s ahead of each spawn.
+function drawTelegraphs() {
+  if (!waves.pending) return;
+  const pulse = 0.45 + 0.55 * (0.5 + 0.5 * Math.sin(state.time * CONFIG.blinkRate));
+
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = "bold 46px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.lineJoin = "round";
+  for (const it of waves.pending.items) {
+    ctx.globalAlpha = pulse * 0.32;
+    ctx.fillStyle = "#ff3b1f";
+    ctx.beginPath();
+    ctx.arc(CONFIG.W - 26, it.y, 27, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.globalAlpha = pulse;
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = "rgba(45, 0, 0, 0.92)";
+    ctx.strokeText("!", CONFIG.W - 26, it.y + 2);
+    ctx.fillStyle = "#ff5a2e";
+    ctx.fillText("!", CONFIG.W - 26, it.y + 2);
+  }
+  ctx.restore();
+}
+
+/* ==========================================================================
+   8. GAME STATE  - start / playing / game over
+   ========================================================================== */
+const state = {
+  mode: "start",     // "start" | "playing" | "over"
+  elapsed: 0,        // score = seconds survived
+  best: 0,
+  bestAtStart: 0,    // best when this run began (identifies a "NEW BEST")
+  bestSavedAt: 0,    // last time the running record was written to storage
+  time: 0,           // always-running clock used for blinking/pulsing
+  lock: 0,           // input lock right after dying (anti double-tap)
+  shake: 0,          // remaining screen-shake time
+  newBest: false
+};
+
+/* ---- storage: localStorage with tab-scope + in-memory fallbacks.
+   Private mode, blocked cookies and sandboxed frames can make even touching
+   window.localStorage throw, and Chrome/Firefox treat file:// pages as an
+   opaque origin with no localStorage at all (double-clicked index.html).
+   So availability is probed once and every access is guarded:
+     1. localStorage (survives restarts, new tabs, new windows)
+     2. window.name  (survives refresh + back/forward in the SAME tab,
+                      even on file:// where localStorage is blocked)
+     3. plain memory (survives the session only, but never throws) */
+const STORAGE = (function () {
+  const mem = Object.create(null);
+  let live = false;
+
+  // Merely READING window.localStorage can throw (blocked cookies,
+  // sandboxed iframe, opaque file:// origin), so resolve it through a
+  // helper instead of touching window.localStorage inline.
+  function ls() {
+    try {
+      const w = (typeof window !== "undefined") ? window : null;
+      if (!w) return null;
+      const s = w.localStorage;
+      if (!s || typeof s.getItem !== "function" ||
+          typeof s.setItem !== "function" || typeof s.removeItem !== "function") {
+        return null;
+      }
+      return s;
+    } catch (e) {
+      return null;                    // property access itself threw
+    }
+  }
+
+  try {
+    const s = ls();
+    if (s) {
+      const probe = "__spikeDodgerProbe__";
+      s.setItem(probe, "1");
+      live = s.getItem(probe) === "1";
+      s.removeItem(probe);
+    }
+  } catch (e) {
+    live = false;                 // storage is unavailable -> fallbacks below
+  }
+
+  // Tier 2: window.name survives refresh / back-forward in the SAME tab even
+  // when localStorage is blocked (file:// opaque origin). It is just a string,
+  // so our scores live under a namespaced JSON envelope; anything else a page
+  // stored in window.name is left alone when it is not our envelope.
+  function getWinName() {
+    try {
+      if (typeof window !== "undefined" && typeof window.name === "string") {
+        return window.name;
+      }
+    } catch (e) { /* reading window.name itself threw */ }
+    return null;
+  }
+
+  function readNameSlot(key) {
+    const n = getWinName();
+    if (!n || n.charAt(0) !== "{") return null;
+    try {
+      const o = JSON.parse(n);
+      if (o && typeof o === "object" && o.__spikeDodger &&
+          typeof o.__spikeDodger === "object" &&
+          typeof o.__spikeDodger[key] === "string") {
+        return o.__spikeDodger[key];
+      }
+    } catch (e) { /* not our envelope, or JSON changed under us */ }
+    return null;
+  }
+
+  function writeNameSlot(key, value) {
+    const cur = getWinName();
+    let base = {};
+    if (cur && cur.charAt(0) === "{") {
+      try {
+        const o = JSON.parse(cur);
+        if (o && typeof o === "object") base = o;
+      } catch (e) { base = {}; }
+    }
+    if (!base.__spikeDodger || typeof base.__spikeDodger !== "object") {
+      base.__spikeDodger = {};
+    }
+    base.__spikeDodger[key] = String(value);
+    try {
+      window.name = JSON.stringify(base);
+    } catch (e) { /* window.name unwritable -> memory tier still holds */ }
+  }
+
+  return {
+    isLive: function () { return live; },
+    get: function (key) {
+      if (live) {
+        const s = ls();
+        if (!s) { live = false; }
+        else {
+          try {
+            const v = s.getItem(key);
+            if (v !== null) return v;
+            // Key missing in real storage but present in a fallback tier
+            // (e.g. written just before storage died) -> fall through below.
+          } catch (e) { live = false; }
+        }
+      }
+      const n = readNameSlot(key);
+      if (n !== null) return n;
+      return Object.prototype.hasOwnProperty.call(mem, key) ? mem[key] : null;
+    },
+    set: function (key, value) {
+      mem[key] = String(value);
+      writeNameSlot(key, value);
+      if (live) {
+        const s = ls();
+        if (!s) { live = false; }
+        else {
+          try { s.setItem(key, String(value)); } catch (e) { live = false; }
+        }
+      }
+    }
+  };
+})();
+
+// isLive() is kept for the diagnostics harness (headless tests, consoles).
+// The game itself never branches on it: get()/set() fall through tiers
+// internally, so the best score survives even when storage dies mid-run.
+
+const BEST_KEY = "spikeDodgerBest";
+
+function loadBest() {
+  const v = parseFloat(STORAGE.get(BEST_KEY));
+  return isFinite(v) && v > 0 ? v : 0;
+}
+
+function saveBest(v) {
+  STORAGE.set(BEST_KEY, v.toFixed(2));
+}
+
+// Used for both "start" and "restart": wipes every bit of run state.
+function startGame() {
+  state.mode = "playing";
+  state.elapsed = 0;
+  state.lock = 0;
+  state.shake = 0;
+  state.newBest = false;
+  state.bestAtStart = state.best;   // to tell "NEW BEST" apart at the end
+  state.bestSavedAt = 0;
+  resetBird();
+  resetWaves();
+  flap();                     // the click that starts you also lifts you
+}
+
+function die() {
+  if (state.mode !== "playing") return;
+  state.mode = "over";
+  state.lock = CONFIG.deathLock;
+  state.shake = CONFIG.shakeTime;
+  if (state.elapsed > state.best) state.best = state.elapsed;
+  state.newBest = state.best > state.bestAtStart;
+  saveBest(state.best);       // always commit the final value
+}
+
+function onInput() {
+  if (state.mode === "start") startGame();
+  else if (state.mode === "playing") flap();
+  else if (state.lock <= 0) startGame();     // game over -> full instant reset
+}
+
+function checkCollisions() {
+  // ceiling
+  if (bird.y - HITBOX_R <= 0) { die(); return; }
+  // rocky floor
+  if (bird.y + HITBOX_R >= GROUND_Y) { die(); return; }
+
+  for (const s of spikes) {
+    const half = s.h / 2;
+    // cheap bounding-box reject before the exact circle/triangle test
+    if (bird.x + HITBOX_R < s.x - s.w) continue;
+    if (bird.x - HITBOX_R > s.x) continue;
+    if (bird.y + HITBOX_R < s.y - half) continue;
+    if (bird.y - HITBOX_R > s.y + half) continue;
+
+    const t = spikeTri(s, CONFIG.spikeHitboxScale);
+    if (circleTri(bird.x, bird.y, HITBOX_R, t[0], t[1], t[2])) { die(); return; }
+  }
+}
+
+
+/* ==========================================================================
+   9. UPDATE
+   ========================================================================== */
+function update(dt) {
+  const df = dt * 60;                 // delta frames @60fps
+
+  state.time += dt;
+  if (state.lock > 0) state.lock = Math.max(0, state.lock - dt);
+  if (state.shake > 0) state.shake = Math.max(0, state.shake - dt);
+
+  updateBackground(dt);
+
+  if (state.mode === "start") {
+    // idle hover on the title screen
+    bird.vy = 0;
+    bird.y = GROUND_Y * CONFIG.startYRatio + Math.sin(state.time * 2.4) * 11;
+    bird.wingT += dt * CONFIG.wingSpeed * 0.6;
+
+  } else if (state.mode === "playing") {
+    state.elapsed += dt;
+
+    // Keep BEST live while you are beating it, and commit the running record to
+    // storage as you go - so a refresh, tab close or crash can never eat it.
+    if (state.elapsed > state.best) {
+      state.best = state.elapsed;
+      if (state.elapsed - state.bestSavedAt >= CONFIG.bestSaveInterval) {
+        state.bestSavedAt = state.elapsed;
+        saveBest(state.best);
+      }
+    }
+
+    updateBird(dt, df, false);
+    updateSpikes(dt);
+    updateWaveScheduler(dt);
+    checkCollisions();
+
+  } else {
+    // dead: keep the world drifting and let the bird tumble onto the rocks
+    updateBird(dt, df, true);
+    updateSpikes(dt);
+  }
+}
+
+/* ==========================================================================
+   10. RENDER
+   ========================================================================== */
+function render() {
+  ctx.save();
+  if (state.shake > 0) {
+    const amp = (state.shake / CONFIG.shakeTime) * CONFIG.shakeAmp;
+    ctx.translate(rand(-amp, amp), rand(-amp, amp));
+  }
+
+  drawSky();
+  drawStars(state.time);
+  drawMountains();
+  drawGround();
+
+  if (state.mode !== "start") {
+    for (const s of spikes) drawSpike(s);
+    drawTelegraphs();
+  }
+
+  drawBird();
+  drawHUD();
+
+  if (state.mode === "start") drawStartScreen();
+  else if (state.mode === "over") drawGameOverScreen();
+
+  ctx.restore();
+}
+
+function drawHUD() {
+  const shown = state.mode === "start" ? 0 : state.elapsed;
+
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.shadowColor = "rgba(0, 0, 0, 0.70)";
+  ctx.shadowBlur = 12;
+  ctx.shadowOffsetY = 2;
+
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 46px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText(shown.toFixed(1) + "s", 30, 22);
+
+  ctx.fillStyle = "rgba(235, 214, 255, 0.85)";
+  ctx.font = "bold 20px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText("BEST  " + state.best.toFixed(1) + "s", 33, 76);
+  ctx.restore();
+}
+
+function drawStartScreen() {
+  ctx.fillStyle = "rgba(11, 4, 22, 0.45)";
+  ctx.fillRect(-30, -30, CONFIG.W + 60, CONFIG.H + 60);
+
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  ctx.shadowColor = "rgba(255, 90, 40, 0.85)";
+  ctx.shadowBlur = 28;
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 76px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText("SPIKE DODGER", CONFIG.W / 2, CONFIG.H * 0.28);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = "rgba(198, 174, 234, 0.95)";
+  ctx.font = "23px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText("Fly.  Dodge.  Survive.", CONFIG.W / 2, CONFIG.H * 0.28 + 68);
+
+  ctx.globalAlpha = 0.55 + 0.45 * Math.sin(state.time * 4.2);
+  ctx.fillStyle = "#ffd166";
+  ctx.font = "bold 36px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText("Click to start", CONFIG.W / 2, CONFIG.H * 0.64);
+  ctx.globalAlpha = 1;
+
+  ctx.fillStyle = "rgba(215, 195, 245, 0.62)";
+  ctx.font = "19px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText("CLICK  \u00B7  SPACE  \u00B7  \u2191     to flap", CONFIG.W / 2, CONFIG.H * 0.64 + 50);
+  ctx.restore();
+}
+
+function drawGameOverScreen() {
+  ctx.fillStyle = "rgba(11, 4, 22, 0.55)";
+  ctx.fillRect(-30, -30, CONFIG.W + 60, CONFIG.H + 60);
+
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  ctx.shadowColor = "rgba(255, 40, 40, 0.75)";
+  ctx.shadowBlur = 26;
+  ctx.fillStyle = "#ff6b5e";
+  ctx.font = "bold 70px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText("GAME OVER", CONFIG.W / 2, CONFIG.H * 0.26);
+  ctx.shadowBlur = 0;
+
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 46px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText("Time  " + state.elapsed.toFixed(1) + "s", CONFIG.W / 2, CONFIG.H * 0.26 + 78);
+
+  ctx.fillStyle = state.newBest ? "#8ef06a" : "rgba(235, 214, 255, 0.92)";
+  ctx.font = "bold 27px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText((state.newBest ? "NEW BEST  " : "BEST  ") + state.best.toFixed(1) + "s",
+    CONFIG.W / 2, CONFIG.H * 0.26 + 130);
+
+  ctx.globalAlpha = 0.55 + 0.45 * Math.sin(state.time * 4.2);
+  ctx.fillStyle = "#ffd166";
+  ctx.font = "bold 34px 'Trebuchet MS', 'Segoe UI', sans-serif";
+  ctx.fillText("Click to restart", CONFIG.W / 2, CONFIG.H * 0.66);
+  ctx.restore();
+}
+
+
+/* ==========================================================================
+   11. INPUT
+   ========================================================================== */
+window.addEventListener("keydown", (e) => {
+  if (e.repeat) return;   // holding the key must not machine-gun flaps
+  if (e.code === "Space" || e.code === "ArrowUp" ||
+      e.key === " " || e.key === "ArrowUp" || e.key === "Spacebar") {
+    e.preventDefault();
+    onInput();
+  }
+});
+
+// pointerdown covers mouse, pen and touch in a single handler
+window.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  e.preventDefault();
+  onInput();
+}, { passive: false });
+
+window.addEventListener("contextmenu", (e) => e.preventDefault());
+
+
+/* ==========================================================================
+   12. MAIN LOOP  (requestAnimationFrame + delta time)
+   ========================================================================== */
+let lastTime = 0;
+
+function frame(now) {
+  if (!lastTime) lastTime = now;
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (dt < 0) dt = 0;
+  if (dt > 0.05) dt = 0.05;    // clamp after tab switches / frame hitches
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+
+/* ==========================================================================
+   13. BOOT
+   ========================================================================== */
+function init() {
+  state.best = loadBest();
+  resize();
+  window.addEventListener("resize", resize);
+  initBackground();
+  resetBird();
+  resetWaves();
+  requestAnimationFrame(frame);
+}
+
+init();
+</script>
+</body>
+</html>
